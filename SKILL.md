@@ -7,125 +7,211 @@ description: Automates Chaoxing/Xuexitong (超星学习通) video watching and c
 
 用 computer-use MCP 操作用户已在 Edge 中打开的课程页面，逐节完成「视频 + 章节测验」。
 
+**核心流程（单遍，不跳步）**：视频播完 → 点页面顶部「章节测验」→ 答题 → 提交 → 确认 → 点页面底部「下一节」→ 播放。**不点右侧目录**（只有往回补漏时才用）。
+
+**三条硬规则**：
+1. 确认弹窗出现后**立即点确认**，不截图、不思考、不复核。
+2. 答题**对错一律不复盘**：不读分数、不看绿勾、不重做，提交确认后直接下一节。
+3. **导航只走页面内按钮**：前进用底部「下一节」，切习题用顶部「章节测验」。**禁止点右侧目录**——它不保证当前小节的测验已完成，实测曾因此漏做 1.20 的测验（该测验只允许作答一次，永久丢分）。
+   **唯一例外**：用户明确要求回头补做某一节时，才允许点目录定位。
+
 ## 前置
 
 1. 用户必须已经用**自己的 Edge** 打开学生页面并已登录。不要新开浏览器、不要用 CDP/调试端口、不要 kill Edge 进程。
-2. 视频会检测焦点：Edge 必须保持前台且不最小化，否则自动暂停。开始前提醒用户不要切走窗口。
-3. 用户按 **ESC** 会立即终止 computer-use。发现返回 “Computer Use was stopped by the user” 时，停止操作并汇报进度。
+2. **每个 Exec 脚本开始前，先单独跑一次 Shell 激活窗口**，否则坐标点击会被静默吞掉：
+   ```powershell
+   (New-Object -ComObject WScript.Shell).AppActivate($PID)
+   ```
+3. **运行时守卫**：脚本内每次 `tree()` 后检查是否出现 `not the focused window`；命中就中止本块、重新激活后再续，**绝不在未聚焦时点坐标**（点了不报错、什么都不会发生）。
+4. 视频会检测焦点：Edge 必须保持前台且不最小化。
+5. 用户按 **ESC** 会终止 computer-use。发现 `stopped by the user` 必须 `throw`；若正在长等待块里，直接丢弃该块，**不得重试同一操作**。
 
-## 启动
-
-用 `list_apps` 拿到 `msedge.exe` 的 pid（若无则让用户打开页面）。之后每个 Exec 脚本开头都要定义：
+## 工具函数
 
 ```js
-async function cu(tool_name, args) { return await tools.run_mcp({ server_name: "ide_mcp.config.ext.computer-use", tool_name, args }); }
+const MCP = "ide_mcp.config.ext.computer-use";
+async function cu(n, a) {
+  const r = await tools.run_mcp({ server_name: MCP, tool_name: n, args: a });
+  const s = (r.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("\n");
+  if (s.includes("stopped by the user")) throw new Error("USER_ESC");   // ESC 立刻停
+  return s;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// 只读文本树，约 0.5–0.8s，不耗截图
+const tree = () => cu("get_app_state", { pid: PID, windowId: WIN, disableScreenshot: true, disableDiff: true });
+
+// 带截图，约 3–6s：只在读题和定位「下一节」时用
+async function shot() { return await tools.run_mcp({ server_name: MCP, tool_name: "get_app_state", args: { pid: PID, windowId: WIN, disableDiff: true } }); }
+
+// 坐标点击（窗口根 "0"）：需要最近一次 get_app_state 带过截图
+const clickAt = (x, y) => cu("click", { pid: PID, windowId: WIN, element_id: "0", x, y });
 ```
 
-**等待一律用条件轮询，不要写固定 sleep。** 每次 `get_app_state` 本身耗 0.3–2 秒，所以轮询间隔取 300–500ms 即可，别更密：
+**免截图的路子优先**：目录项、「章节测验」胶囊、播放器文档都是无障碍树节点，直接 `cu("click", { element_id: 节点id })` 就生效。坐标点击留给选项圆圈、提交、确认、下一节。
+
+播放器文档节点 id 的取法（**必须带前导空格**，否则会误匹配 URL 里的 `clazzid=`）：
 
 ```js
-async function waitFor(pid, windowId, pred, { timeout = 8000, interval = 400 } = {}) {
-  const t0 = Date.now();
-  let last = "";
-  while (Date.now() - t0 < timeout) {
-    const st = await cu("get_app_state", { pid, windowId, disableScreenshot: true, disableDiff: true });
-    const t = st.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-    if (pred(t)) return { ok: true, text: t, ms: Date.now() - t0 };
-    last = t;
-    await new Promise(r => setTimeout(r, interval));
-  }
-  return { ok: false, text: last, ms: Date.now() - t0 };
+const line = t.split("\n").find(l => l.includes("knowledge/cards")) || "";
+const id = (/ id=(\d+)/.exec(line) || [])[1];
+```
+
+## 执行纪律
+
+1. **单次 Exec ≤60s**。等视频达标这类长等待，循环按 55s 上限退出，输出一行状态，下一块再续。实测超过 2 分钟的调用会被用户打断，等于白跑。
+2. 块间只输出一行：`elapsed=xxs state=playing|done|popup`。
+3. **禁止在一个 Exec 里既长等待又做多屏读题**，会把一次调用拖到几分钟。
+
+```js
+const t0 = Date.now();
+while (Date.now() - t0 < 55000) {
+  const t = await tree();
+  if (/not the focused window/.test(t)) { text("UNFOCUSED"); exit(); }   // 先 AppActivate 再续
+  if (POPUP(t)) { text("POPUP"); exit(); }
+  if (t.includes("任务点已完成")) { text("DONE"); exit(); }
+  if (!t.includes("音频正在播放")) await pressSpace();
+  await sleep(5000);
 }
+text("STILL_RUNNING " + Math.round((Date.now()-t0)/1000) + "s");
 ```
 
 ## 单节循环
 
-对每一节按以下顺序执行，每步之间重新观察，不要凭记忆复用坐标。点击后立刻 `waitFor` 目标特征，命中就走，命中不了才等满 timeout。
-
-### 1. 进入小节
-点右侧目录里目标小节条目（x≈1080，y 按截图），然后 `waitFor(t => t.includes("任务点") || t.includes("章节测验"))` 确认新页加载完成，不要固定等 3 秒。
-
-### 2. 播放视频
-点视频中央播放按钮（约 527,551），`waitFor(t => t.includes("音频正在播放"), { timeout: 5000 })`。
-
-进度从 UI 树读取，**不要读截图判断进度**：
+### 1. 播放
 
 ```js
-const state = await cu("get_app_state", { pid: PID, windowId: WIN, disableScreenshot: true, disableDiff: true });
-const t = state.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-const prog = t.match(/进度小节"[^\n]*val=([\d.]+)/);   // val 是百分比
-const playing = t.includes("音频正在播放");
-const done = t.includes("任务点已完成");
+await cu("press_key", { pid: PID, windowId: WIN, key: "Ctrl+Home" }); // 进节后回顶，视频才在视野内
+await sleep(350);
+const t = await tree();
+const id = (/ id=(\d+)/.exec(t.split("\n").find(l => l.includes("knowledge/cards")) || "") || [])[1];
+if (id) await cu("click", { pid: PID, windowId: WIN, element_id: id });
+await sleep(300);
+await cu("press_key", { pid: PID, windowId: WIN, key: "Space" });   // Space 比点播放按钮可靠
+await sleep(1500);
 ```
 
-轮询模板（一次 Exec 最多跑 9 分钟，超时会被截断，所以要分段循环）：
+判定：`t.includes("音频正在播放")`。没播就再按一次 `Space`（不要退回坐标点播放按钮）。
+
+进节后若树里已有待答插播题（回看旧节才会出现），先答完再播。
+
+### 2. 等达标（状态机）
 
 ```js
-for (let i = 0; i < 9; i++) {
-  await new Promise(r => setTimeout(r, 60000));
-  const st = await cu("get_app_state", { pid: PID, windowId: WIN, disableScreenshot: true, disableDiff: true });
-  const t = st.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-  const p = t.match(/进度小节"[^\n]*val=([\d.]+)/);
-  const ok = t.includes("任务点已完成");
-  text(`[${i+1}min] ${p ? parseFloat(p[1]).toFixed(1) : "?"}% playing=${t.includes("音频正在播放")} done=${ok}`);
-  if (ok || (p && parseFloat(p[1]) >= 90)) { text("达标"); break; }
-  if (!t.includes("音频正在播放")) { text("视频已暂停"); break; }
+const POPUP = t => /共\s*\d+\s*题[，,]\s*已答对/.test(t)
+                || (/判断题|单选题|多选题/.test(t) && !t.includes("满分") && !t.includes("答题卡"));
+while (true) {
+  const t = await tree();
+  if (POPUP(t)) { await answerInline(); continue; }        // 插播题：原地答，不换页
+  if (t.includes("任务点已完成")) break;                    // 达标，立刻走
+  if (!t.includes("音频正在播放")) { await cu("press_key", { pid: PID, windowId: WIN, key: "Space" }); }
+  await sleep(6000);                                       // 文本树读不到进度，靠 done 标志
 }
 ```
 
-判定完成的条件：`任务点已完成` 出现，或进度 ≥ 90%。达标后**立即停止等待**，不必看完。
+树里读不到播放进度和时长，**不要靠截图判断进度**，只等「任务点已完成」。
 
-间隔自适应：进度 < 80% 时每 60 秒查一次；≥ 80% 后改成 15–30 秒查一次，避免在结尾白等一整分钟（每节可省 30–45 秒）。
+#### 插播题（覆盖在播放器上的深色面板）
 
-### 3. 切到章节测验
-视频播放结束后页面常进入纯视频模式，标题和 `视频 / 章节测验` 胶囊标签都不见了。
+- 树里能读到题干和选项；面板不遮挡右侧目录。
+- 选项圆圈在面板左侧约 13% 窗宽，行距约 11% 窗高；「提交」胶囊约 70% 窗宽 / 89% 窗高。
+- 答完点面板「提交」，面板消失后按 `Space` 继续播。
 
-**不要用 `list-item "章节测验"` 判断标签栏已恢复**——该节点在纯视频模式下依然存在于 DOM，会误判成功。
+### 3. 视频播完 → 章节测验
 
-恢复顺序（每一步都用截图确认标题+胶囊标签真的可见，不能只看树）：
+播完后页面常变纯视频模式，顶部标题和胶囊整块消失，**先回顶再看有没有**：
 
-1. 点地址栏刷新（91,60）。约一半情况有效。
-2. 无效就点左上「返回课程」（36,60）；它会退回到上一状态并重新渲染，实测常能恢复。
-3. 仍无效就点目录里相邻小节，再点回目标小节。
+```js
+await cu("press_key", { pid: PID, windowId: WIN, key: "Ctrl+Home" });
+await sleep(350);
+let t = await tree();
+let tab = (/list-item "章节测验"[^i]*? id=(\d+)/.exec(t) || [])[1];
+if (!tab) {                                   // 顶部没看到就向上滚轮找
+  await cu("scroll", { pid: PID, windowId: WIN, element_id: "0", x: 500, y: 300, delta_x: 0, delta_y: -600 });
+  await sleep(400); t = await tree();
+  tab = (/list-item "章节测验"[^i]*? id=(\d+)/.exec(t) || [])[1];
+}
+if (tab) await cu("click", { pid: PID, windowId: WIN, element_id: tab });
+```
 
-标签栏可见后点「章节测验」（约 210,231），再 `waitFor(t => t.includes("满分"))` 确认进入测验页。
+进页判定用 `满分` 或 `答题卡`，**不要用 `章节测验`**（隐藏节点会误判）。
 
-### 4. 读题与作答
-**一次读完**：滚动 1–2 屏把所有题一次性截完（每屏滚 0.6–0.75 页）。3 道题通常 2 屏就能全看到，先记清每题的题号→选项→y 坐标再动手。
+> 实测：`scroll` 的 `delta_y` 负值在部分页面被当成向下；`Ctrl+End`/`PageUp` 对内容区常常无效。优先用工具栏的 `scroll`，其次 `press_key PageDown`。
 
-- 滚动必须用 `element_id: "0"`（窗口根），配合坐标；用具体控件 id 常常无效。
-- 单选题/判断题的选项圆圈统一在 x≈161，y 以当前截图为准。
-- **点完立刻截图确认圆圈已变实心**。选项行之间有空隙，点偏了不会报错，只会静默漏答。宁可每题验一次，也不要盲连点——漏答后提交会被弹窗拦下，返工更慢。
-- 答案依据课程内容判断；点之前先核对题号与选项字母，避免错行。
+### 4. 读题作答（必须截图：题干字体混淆，树里是乱码）
 
-### 5. 提交
-滚到底部点「提交」（约 590,343，以截图为准）。
+习题页做了字体反爬（「甲午海战」→「懪午懮战」），**只能截图用眼睛读**。
 
-**弹窗文字不在无障碍树里**，`waitFor` 检测不到「确认提交」，不要在这里死等。点完等约 1.2 秒直接截图看弹窗：
+- 一屏读完并**立刻点掉本屏所有题**，再去下一屏；3 题通常 1–2 屏。
+- **缩页实测（1280×720 屏）**：80% 时圆圈 x≈131、行距 **40px**，一屏约 2 题；50% + F11 可把 3 题连同「提交」塞进一屏（圆圈 x≈76、行距 28px、提交 (566,623)、确认 (713,393)）。
+- **50% 的代价**：行距 28px，偏 ±8px 就落到相邻选项。实测把 C 点成 D，直接丢 33.3 分。**默认用 80%；50% 只在题 ≤3 且行距能精确读出时用。**
+- **缩放不是免费的**：非 100% 缩放下点中选项会触发「滚动到焦点」，页面会自己位移，**上一张截图的坐标随即失效**。所以一次截图只点一道题，点完立刻重新截图，不要拿一张图的坐标连点一串。
+- **选项圆圈固定在 x≈161**（100% 缩放）；x≈130 点空，不报错、静默漏答。
+- 答案按课程内容判断；对错不计较（见硬规则 2）。
 
-- 显示「确认提交?」→ 点「提交」（约 780,440）。
-- 显示「您还有未做完的 单选题，确认提交吗?」→ **必须点「取消」**（约 658,440），回去补选漏掉的题，重新提交。
+### 5. 提交 → 确认（不犹豫）
 
-### 6. 验证
-提交后等约 2.5 秒截图，直接看结果页是否每题绿勾 + 「本次成绩 100 分」。看到 100 分即可结束本节。若有红叉，记下错题，不要重复提交同一份答案。
+```js
+await cu("scroll", { pid: PID, windowId: WIN, element_id: "0", x: 500, y: 450, delta_x: 0, delta_y: 900 });
+await sleep(500);           // 滚到底
+await clickAt(590, 550);    // 「提交」
+await sleep(800);
+await clickAt(780, 440);    // 「确认提交?」→ 直接点，不看不想
+```
 
-### 7. 下一节
-点目录下一节条目，`waitFor(t => t.includes("任务点"))` 确认已进入新节，然后直接循环到第 2 步。目录条目 y 坐标按当前截图推算，用完即弃。
+出现「还有未做完的题」说明有选项点偏：点「取消」(658,440) 补选后重提，不要强提交。
+
+### 6. 下一节
+
+滚到底找「下一节」（1280×672 窗口实测 y≈548，随页面高度浮动，用一张截图定位）：
+
+```js
+await cu("scroll", { pid: PID, windowId: WIN, element_id: "0", x: 500, y: 450, delta_x: 0, delta_y: 900 });
+await sleep(400);
+await clickAt(847, 548);
+```
+
+节点树里**没有**「下一节」按钮，只能用坐标。
+
+### 7. 窗口耗时
+
+`T0` 取「任务点已完成」那一刻，终点取新节 `音频正在播放`：
+
+```js
+text("WINDOW=" + ((Date.now()-T0)/1000).toFixed(1) + "s");
+```
+
+实测参考：新节加载 2.5–7s（有缓存时 2.5s），点播放到出声约 1.5s，答案读图 3–6s/张。
+3 题一屏的节约 13–17s；需要翻第二屏或题多则 20s 以上——如实汇报，不掩饰。
+
+## 已确认答案（避免重犯）
+
+| 节 | 题 | 正确项 |
+|---|---|---|
+| 1.20 | 判断：现代国防斗争以军事实力对抗为主，也是多种非武装斗争形式的综合角逐 | **对** |
+| 1.21 | 单选：蒙哥马利要把进攻（ ）列为世界一大禁忌 | 俄罗斯 |
+| 1.21 | 多选：（ ）构成我国国力的基本要素 | 经济实力、国防实力、民族凝聚力 |
+| 1.22 | 单选：2003 年布什降落林肯号宣布（ ）战争结束 | 伊拉克 |
+| 1.22 | 单选：（ ）说没有原子弹卫星就没有国际地位 | 邓小平 |
 
 ## 常见故障
 
 | 现象 | 处理 |
 |---|---|
-| `get_app_state` 截图变成小块 “javascript:void(0);” | 页面弹出了同进程的小弹层干扰截图。调用时显式传主窗口 `windowId`（如 590796），并加 `disableDiff: true` |
-| 点击 `element_id` 无反应 | 该站点的控件是坐标热区。改用主窗口根 `element_id: "0"` + 截图坐标 |
-| 目录点击后没有标签栏 | 依次试刷新 → 「返回课程」→ 切别的小节再切回，每步都要截图确认胶囊标签可见 |
-| `waitFor` 明明没出现却返回 ok | 无障碍树里可能存在隐藏节点（如纯视频模式下的 `章节测验` 标签）。对「是否可见」的判断一律以截图为准 |
-| 提交弹窗提示「还有未做完的题」 | 说明有选项点偏了。点「取消」回去补选，不要强提交 |
-| 进度长时间不动 | 视频暂停了，多半是 Edge 失焦/最小化；提醒用户切回窗口后点播放按钮 |
-| 测验提交后仍有题「待完成」 | 说明视频任务点未真正达标（进度 < 90%），回去补播 |
-| 返回 “stopped by the user” | 用户按了 ESC，立刻停下并汇报当前进度 |
-| 节奏慢、像卡住 | 检查有没有残留固定 `setTimeout`。命中条件就该立刻走，正常每节切换+答题应在 10–20 秒内完成（不含看视频） |
+| 点了没反应 / 树里出现 `not the focused window` | Edge 不在前台。先 `AppActivate($PID)`，再操作 |
+| 播放起不来 | 点播放器文档节点拿到焦点，再按 `Space`；坐标点播放按钮常失效 |
+| 页面停在内容中部看不到顶部胶囊 | 先 `Ctrl+Home`，不行再用 `scroll` 向上 |
+| 坐标点击静默失效 | 最近一次 `get_app_state` 必须带截图；翻屏/加载后重新 `shot()` |
+| 点选项后页面自己位移、后续连点全失效 | 缩放 <100% 时点中会「滚动到焦点」。一次截图只点一道题，点完立刻重拍 |
+| 习题页题干是乱码 | 字体反爬，只能截图读 |
+| 点选项没选中也不报错 | 圆圈固定在 x≈161（100%）；80% 时 x≈131 |
+| 插播题弹出、视频暂停 | 原地作答（不换页），答完按 `Space` 继续 |
+| 回到任务点已绿的旧节，弹窗又出现 | 那节插播题没答，先补答再播放 |
+| 提交弹窗迟迟不点 | 违规。弹窗出现即点确认（100% 缩放时 (780,440)） |
+| 想验证得分 | 不需要。只允许作答一次，复盘无收益，直接下一节 |
+| 返回 `stopped by the user` | 用户按 ESC：立刻停止、汇报已完成小节与当前进度、**丢弃正在跑的长等待块**，不得重试同一操作 |
+| 选错题标 `x≈161` 仍然漏答 | 先确认页面没有因滚动导致整体位移，重新 `shot()` 后按新坐标点 |
 
 ## 汇报
 
-每完成一节用一行汇报：`1.7 ✅ 100分`。全部结束后给一份清单：已完成小节、得分、未完成小节及原因。中途主动说明还剩哪些节、每节大致耗时（视频约 10–15 分钟/节）。
+每节一行：`1.20 ✅ 15.3s`（超 20s 标 ⚠️ 并注明卡在哪一步）。全部结束后给清单：已完成小节、各节窗口耗时、未完成小节及原因。分数只在用户明确要求时回看。
