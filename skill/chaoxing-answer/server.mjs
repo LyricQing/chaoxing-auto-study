@@ -115,17 +115,40 @@ async function attempt(q, valid, extra) {
   return { raw, letters: parseLetters(raw, valid) };
 }
 
+/* 只允许超星页面调用：否则任何网页都能借你的 key 白嫖额度 */
+const CLIENT_HEADER = "x-csx-client";
+
+function originAllowed(origin) {
+  if (!origin) return true; /* curl / 本地脚本 */
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+    return u.hostname === "chaoxing.com" || u.hostname.endsWith(".chaoxing.com");
+  } catch (e) {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
+  const origin = req.headers.origin;
+  const allow = originAllowed(origin);
+
   const send = (code, obj) => {
-    res.writeHead(code, {
+    const headers = {
       "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
-      "access-control-allow-headers": "content-type",
       "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-headers": "content-type," + CLIENT_HEADER,
       "access-control-allow-private-network": "true",
-    });
+    };
+    if (allow && origin) {
+      headers["access-control-allow-origin"] = origin;
+      headers["vary"] = "Origin";
+    }
+    res.writeHead(code, headers);
     res.end(JSON.stringify(obj));
   };
+
+  if (!allow) return send(403, { error: "origin not allowed" });
 
   if (req.method === "OPTIONS") return send(204, {});
   if (req.method === "GET" && req.url === "/health") {
@@ -133,6 +156,11 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method !== "POST" || req.url !== "/answer") {
     return send(404, { error: "not found" });
+  }
+
+  /* 自定义头会强制预检，挡住「简单请求」式的滥用 */
+  if (req.headers[CLIENT_HEADER] !== "extension") {
+    return send(403, { error: "client header required" });
   }
 
   let body = "";

@@ -9,7 +9,10 @@
     try {
       const r = await fetch(BRIDGE, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-csx-client": "extension",
+        },
         body: JSON.stringify({
           typeLabel: q.typeLabel || "",
           stem: q.stem,
