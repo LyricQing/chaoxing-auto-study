@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "学习通题目明文",
   "version": "1.0.2",
-  "description": "解出章节测验的混淆题干，还原为明文；按题库自动填入，由你确认提交。",
+  "description": "解出章节测验的混淆题干，还原为明文；按题库或模型自动作答并提交，含空卷拦截。",
   "permissions": [
     "storage"
   ],
