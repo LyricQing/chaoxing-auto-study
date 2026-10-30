@@ -1,0 +1,8 @@
+{
+  "backend": "openai",
+  "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+  "model": "deepseek-v4-1-flash-261017",
+  "apiKey": "PUT-YOUR-KEY-HERE",
+  "maxTokens": 512,
+  "timeout": 90000
+}
